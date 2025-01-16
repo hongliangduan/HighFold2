@@ -26,20 +26,10 @@ def create_batch_from_dataset(row,crop_size):
     batch['all_atom_mask'] = all_positions_mask
 
     if len(batch['aatype']) > crop_size and crop_size:
-    # if crop_size:
         print('crop')
         nk = chain_lens(batch['residue_index'])
-        # flag = np.random.randint(0, 2)
-        # if flag == 0:
         if True:
             seq_mask = cropcontiguous(nk, crop_size)
-        # else:
-        #     if len(nk) >= 2:
-        #         del batch['seq_mask']
-        #         ca_coordinates = get_ca_coordinates(row['native_pdb'])
-        #         interface_idx = np.random.randint(nk[0], nk[0]+nk[1])
-        #         seq_mask = cropspatial(ca_coordinates, interface_idx, crop_size)
-        #         batch['seq_mask'] = np.array(seq_mask)
 
             batch['all_atom_positions'] = batch['all_atom_positions'][seq_mask == 1]
             batch['all_atom_mask'] = batch['all_atom_mask'][seq_mask == 1]
@@ -94,7 +84,6 @@ def create_batch_from_dataset(row,crop_size):
         pep_index = batch['aatype']
         pep_index = batch['aatype'][start:end]
         pep_chara = [residue_constants.resnames[i] for i in pep_index]
-        # print(pep_chara)
         ligand_smiles = ''
         for i in pep_chara:
             ligand_smiles += smiles_dict[i]

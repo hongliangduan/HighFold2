@@ -99,10 +99,6 @@ def fill_af_coords(chain_order,all_resids,all_coords):
 
 
 
-# def prep_jnp_batch(batch):
-#     return jax.tree_map(lambda x: jnp.array(x), batch)
-
-
 def flatten_dict(d, parent_key='', sep='//'):
 
     items = []
@@ -127,7 +123,6 @@ def norm_grads_per_example(grads, l2_norm_clip):
 
 def collate_fn(batch):
     for sample in batch:
-        # jnp_sample = {key: jnp.array(value) for key, value in sample.items()}
         return sample
     
 def save_pdb(predicted_dict, batch, save_path, epoch, pdbid):
@@ -142,40 +137,7 @@ def save_pdb(predicted_dict, batch, save_path, epoch, pdbid):
     with open(outfile, 'w') as f:
         f.write(protein.to_pdb(unrelaxed_protein))
 
-# def cropcontiguous(nk, N_res):
-#     n_added = 0
-#     n_remaining = N_res
-#     N_chains = len(nk) 
-#     masks = []
-#     chains = sorted(nk)
-#     new_masks = []
-    
-#     for k in range(N_chains):
-#         n_remaining -= chains[k]
-        
-#         crop_size_max = min(N_res - n_added, chains[k])
-#         crop_size_min = min(chains[k], max(0, N_res - (n_added + n_remaining)))
 
-#         if crop_size_min > crop_size_max:
-#             crop_size_min, crop_size_max = crop_size_max, crop_size_min
-        
-#         crop_size = crop_size_min
-#         n_added += crop_size
-        
-#         crop_start = np.random.randint(0, chains[k] - crop_size + 1)
-#         mk = np.zeros(chains[k], dtype=float)
-#         mk[crop_start:crop_start + crop_size] = 1
-        
-#         masks.append(mk)
-    
-#     for i in nk:
-#         for j in masks:
-#             if len(j) == i:
-#                 new_masks.append(j)
-    
-#     new_masks = np.concatenate(new_masks)
-
-#     return new_masks
 def cropcontiguous(nk, N_res):
     n_added = 0
     n_remaining = N_res
@@ -326,19 +288,8 @@ def bonds_from_smiles(smiles_string, atom_encoding):
                 bond_matrix[si,ei] = bond_type
                 bond_matrix[ei,si] = bond_type
 
-    #Get a distance matrix
-    #Add Hs
-    # m = Chem.AddHs(m)
-    #Embed in 3D
-    # AllChem.EmbedMolecule(m, maxAttempts=500)
-    #Remove Hs to fit other dimensions (will cause error if mismatch on mult with has_bond)
-    # m = Chem.RemoveHs(m)
-    # D=AllChem.Get3DDistanceMatrix(m)
-    #Get the bond positions
     has_bond = copy.deepcopy(bond_matrix)
     has_bond[has_bond>0]=1
-
-    # return np.array(atom_types), np.array(atoms), bond_matrix, D*has_bond, has_bond
     return np.array(atom_types), np.array(atoms), bond_matrix, has_bond
 
 def get_atom_features(smiles_string):
@@ -349,24 +300,17 @@ def get_atom_features(smiles_string):
                     'As':10, 'Co':10, 'Fe':10, 'Mg':10, 'Pt':10, 'Rh':10, 'Ru':10, 'Se':10, 'Si':10, 'Te':10, 'V':10, 'Zn':10 #Joint (rare)
                     }
 
-    #Get the atom types and bonds
-    # atom_types, atoms, bond_types, bond_lengths, bond_mask = bonds_from_smiles(input_smiles, atom_encoding)
     atom_types, atoms, bond_types, bond_mask = bonds_from_smiles(input_smiles, atom_encoding)
 
     ligand_feats = {}
     ligand_feats['atoms'] = atoms
     ligand_feats['atom_types'] = atom_types
     ligand_feats['bond_types'] = bond_types
-    # ligand_inp_feats['bond_lengths'] = bond_lengths
     ligand_feats['bond_mask'] = bond_mask
     return ligand_feats
 
 def get_bond_feat(ligand_feats):
     atom_len = len(ligand_feats['atoms'])
-    # bond_feat = np.zeros((atom_len,atom_len,6))
-    # bond_feat[:,:,:5] = (np.eye(6)[np.array(ligand_feats['bond_types'],dtype=int)])[:,:,1:]
-    # bond_feat[:,:,5] = ligand_feats['bond_mask']
-    # or this way
     bond_feat = (np.eye(6)[np.array(ligand_feats['bond_types'],dtype=int)])
     return bond_feat
 def get_atom_feat(ligand_feats):

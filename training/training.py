@@ -33,27 +33,6 @@ model_config.model.global_config.use_remat = True
 class PoolLayer(hk.Module):
     def __init__(self, head=8):
         super(PoolLayer, self).__init__()
-        # self.bond_qury = hk.Sequential([
-        #     hk.Linear(6),
-        #     jax.nn.relu,
-        #     hk.Linear(6),
-        #     jax.nn.relu,
-        #     hk.Linear(6),
-        # ])
-        # self.bond_key = hk.Sequential([
-        #     hk.Linear(6),
-        #     jax.nn.relu,
-        #     hk.Linear(6),
-        #     jax.nn.relu,
-        #     hk.Linear(6),
-        # ])
-        # self.bond_value = hk.Sequential([
-        #     hk.Linear(6),
-        #     jax.nn.relu,
-        #     hk.Linear(6),
-        #     jax.nn.relu,
-        #     hk.Linear(6),
-        # ])
         self.head = head
         self.layernorm = hk.LayerNorm(axis=1, create_scale=True, create_offset=True)
     
@@ -110,15 +89,6 @@ class PoolLayer(hk.Module):
     def __call__(self, bond_feat, atom_feat, M):
         F = (1.0 - M + 1e-6) / (M - 1e-6)
         
-        # N, N, n = bond_feat.shape
-        # bond_feat = jnp.reshape(bond_feat, (N*N, 6))
-        # bond_qury = self.bond_qury(bond_feat) # [N*N, 6]
-        # bond_key = self.bond_key(bond_feat) # [N*N, 6]
-        # bond_value = self.bond_value(bond_feat) # [N*N, 6]
-        # score = jax.nn.softmax(jnp.matmul(bond_qury, bond_key.T) / jnp.sqrt(6)) # [N*N, N*N]
-        # bond = jnp.matmul(score, bond_value) # [N*N, 6]
-        # bond = jnp.reshape(bond, (N, N, 6))
-        
         bond = self.linear1(bond_feat) # [N, N, 1]
         Ms_bond1 = jax.nn.softmax(jnp.transpose(bond, (0, 2, 1)) + F[:, :, None], axis=0)  # [N, Nr, N]
         bond_pool = jnp.matmul(bond.transpose(0, 2, 1), Ms_bond1.transpose(0, 2, 1))  # [N, 1, Nr]
@@ -126,7 +96,6 @@ class PoolLayer(hk.Module):
         Ms_bond2 = jax.nn.softmax(bond_pool + F[:, :, None], axis=0) # [N, Nr, Nr]
         bond_pool = jnp.matmul(bond_pool.transpose(2, 1, 0), Ms_bond2.transpose(1, 0, 2)) # [Nr, 1, Nr]
         bond_pool = self.linear2(bond_pool.transpose(0, 2, 1)) # [Nr, Nr, 1]
-        # bond_pool = jnp.squeeze(bond_pool, axis=2)
 
         x_clone = atom_feat
         atom_qury = self.atom_qury(atom_feat) # [N, 32]
@@ -142,8 +111,6 @@ class PoolLayer(hk.Module):
         atom = jnp.matmul(score, V) # [head, N, head_dim]
         atom = atom.transpose(1, 0, 2).reshape(-1, atom_qury.shape[-1])  # [N, 32]
         atom = self.linear3(atom) # [N, 11]
-        # atom = atom + x_clone
-        # atom = self.layernorm(atom)
         atom = self.linear4(atom)
         Ms_atom = jax.nn.softmax(atom[:, None, :] + F[:, :, None], axis=0) # [N,Nr,21]
         atom_pool = jnp.matmul(atom.T[:, None, :], Ms_atom.transpose(2, 0, 1)) # [21,1,Nr]
@@ -170,7 +137,6 @@ model_runner = model.RunModel(model_config, af2_model_params, is_training=True, 
 
 def get_loss_fn(model_params, key, processed_feature_dict):
     pool_params, af2_model_param = hk.data_structures.partition(lambda m, n, p: m[:9] != "alphafold", model_params)
-    # print(pool_params)
     L = len(processed_feature_dict['aatype'])
     bond_rep_plus_init = jnp.zeros((L, L, 128), dtype = 'bfloat16')
     atom_rep_plus_init = jnp.zeros((L, 21), dtype = 'bfloat16')
@@ -183,7 +149,6 @@ def get_loss_fn(model_params, key, processed_feature_dict):
         mask = processed_feature_dict['ligand_feats_dict'][key]['mask']
         bond_rep, atom_rep = jax.jit(pool.apply)(pool_params, rng, bond_feat, atom_feat, mask)
         bond_rep_plus = bond_rep_plus.at[start:end,start:end,:].set(bond_rep.astype('bfloat16'))
-        # bond_rep_plus = bound_rep_plus_init.at[start:end,start:end,0].set(bond_rep.astype('bfloat16'))
         atom_rep_plus = atom_rep_plus.at[start:end,:].set(atom_rep.astype('bfloat16'))
     processed_feature_dict['bond_rep_plus'] = bond_rep_plus
     processed_feature_dict['atom_rep_plus'] = atom_rep_plus
@@ -193,10 +158,8 @@ def get_loss_fn(model_params, key, processed_feature_dict):
     loss, predicted_dict = model_runner.apply(af2_model_param, key, processed_feature_dict)
     loss = loss[0]
     if processed_feature_dict['is_continuous']:
-        # print('is_continuous')
         loss = loss
     else:
-        # print('is_discrete')
         loss = loss * 0.5
     del processed_feature_dict['is_continuous']
     return loss, predicted_dict
@@ -228,14 +191,6 @@ valid_params_loader = {
 train_loader = torch.utils.data.DataLoader(training_set, **train_params_loader)
 valid_loader = torch.utils.data.DataLoader(valid_set, **valid_params_loader)
 
-# optimizer
-# scheduler = optax.linear_schedule(1e-3, 1e-3, 1000, 0)
-# lr_coef = 0.025
-# chain_me = [
-#     optax.scale_by_adam(b1=0.9, b2=0.999, eps=1e-6),
-#     optax.scale_by_schedule(scheduler),
-#     optax.scale(-1.0*lr_coef),
-# ]
 lr = 7.5e-5
 chain_me = [
     optax.scale_by_adam(b1=0.9, b2=0.999, eps=1e-6),
@@ -244,7 +199,6 @@ chain_me = [
 gradient_transform = optax.chain(*chain_me)
 replicated_params = jax.tree_map(lambda x: jnp.array(x), model_params)
 opt_state = gradient_transform.init(replicated_params)
-# opt_state = gradient_transform.init(pool_params)
 
 def grad_update(grads_sum, grads_sum_count, opt_state, replicated_params):
     grads_sum = jax.tree_map(lambda x: x/grads_sum_count, grads_sum)
@@ -270,11 +224,6 @@ for e in range(30):
         global_step += 1
         print(f'sample {n} loss: {loss}')
 
-        # grads = norm_grads_per_example(grads, l2_norm_clip=10)
-        # updates, opt_state = gradient_transform.update(grads, opt_state)
-        # replicated_params = optax.apply_updates(replicated_params, updates)
-
-        # gradient accumulation
         if grads_sum_count == 0:
             grads_sum = grads
         else:
@@ -289,9 +238,6 @@ for e in range(30):
             replicated_params = optax.apply_updates(replicated_params, updates)
             # replicated_params = optax.apply_updates(pool_params, updates)
             grads_sum, grads_sum_count = None, 0
-        # jax.clear_backends()
-        # gc.collect()
-        # del batch
         batch.clear()
 
         # validation
@@ -303,9 +249,6 @@ for e in range(30):
                 loss, grads, predicted_dict = train_step(replicated_params, subkey, batch)
                 valid_set_loss += loss
                 save_pdb(predicted_dict, batch, './validation_predictions', global_step, pdbid)
-                # jax.clear_backends()
-                # gc.collect()
-                # del batch
             
             print(f'validation set loss: {valid_set_loss}')
             valid_set_losses.append(valid_set_loss)
