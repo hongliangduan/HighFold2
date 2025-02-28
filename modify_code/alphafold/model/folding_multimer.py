@@ -427,7 +427,7 @@ class FoldIteration(hk.Module):
     safe_key, *sub_keys = safe_key.split(3)
     sub_keys = iter(sub_keys)
     act = safe_dropout_fn(act, next(sub_keys))
-    act = common_modules.LayerNorm(
+    act = hk.LayerNorm(
         axis=-1,
         create_scale=True,
         create_offset=True,
@@ -448,7 +448,7 @@ class FoldIteration(hk.Module):
         act = jax.nn.relu(act)
     act += input_act
     act = safe_dropout_fn(act, next(sub_keys))
-    act = common_modules.LayerNorm(
+    act = hk.LayerNorm(
         axis=-1,
         create_scale=True,
         create_offset=True,
@@ -500,7 +500,7 @@ def generate_monomer_rigids(representations: Mapping[str, jnp.ndarray],
   """
   c = config
   sequence_mask = batch['seq_mask'][:, None]
-  act = common_modules.LayerNorm(
+  act = hk.LayerNorm(
       axis=-1, create_scale=True, create_offset=True, name='single_layer_norm')(
           representations['single'])
 
@@ -523,28 +523,31 @@ def generate_monomer_rigids(representations: Mapping[str, jnp.ndarray],
           rigid
   }
 
-  act_2d = common_modules.LayerNorm(
+  act_2d = hk.LayerNorm(
       axis=-1,
       create_scale=True,
       create_offset=True,
       name='pair_layer_norm')(
           representations['pair'])
 
+  safe_keys = safe_key.split(c.num_layer)
   outputs = []
-  def fold_iter(act, key):
-      act, out = fold_iteration(
-          act,
-          initial_act=initial_act,
-          static_feat_2d=act_2d,
-          aatype=batch['aatype'],
-          safe_key=prng.SafeKey(key),
-          sequence_mask=sequence_mask,
-          update_rigid=True,
-          is_training=is_training)
-      return act, out
+  for key in safe_keys:
 
-  keys = jax.random.split(safe_key.get(), c.num_layer)
-  activations, output = hk.scan(fold_iter, activations, keys)
+    activations, output = fold_iteration(
+        activations,
+        initial_act=initial_act,
+        static_feat_2d=act_2d,
+        aatype=batch['aatype'],
+        safe_key=key,
+        sequence_mask=sequence_mask,
+        update_rigid=True,
+        is_training=is_training,
+        )
+    outputs.append(output)
+
+  output = jax.tree_multimap(lambda *x: jnp.stack(x), *outputs)
+  # Pass along for LDDT-Head.
   output['act'] = activations['act']
 
   return output
@@ -559,12 +562,10 @@ class StructureModule(hk.Module):
   def __init__(self,
                config: ml_collections.ConfigDict,
                global_config: ml_collections.ConfigDict,
-               compute_loss,
                name: str = 'structure_module'):
     super().__init__(name=name)
     self.config = config
     self.global_config = global_config
-    self.compute_loss = compute_loss
 
   def __call__(self,
                representations: Mapping[str, jnp.ndarray],
@@ -599,7 +600,6 @@ class StructureModule(hk.Module):
 
     aatype = batch['aatype']
     seq_mask = batch['seq_mask']
-    
 
     atom14_pred_mask = all_atom_multimer.get_atom14_mask(
         aatype) * seq_mask[:, None]
@@ -610,14 +610,14 @@ class StructureModule(hk.Module):
     atom37_mask = all_atom_multimer.get_atom37_mask(aatype) * seq_mask[:, None]
     atom37_pred_positions = all_atom_multimer.atom14_to_atom37(
         atom14_pred_positions, aatype)
-    atom37_pred_positions *= atom37_mask[:, :, None] #zc
+    atom37_pred_positions *= atom37_mask[:, :, None]
     ret['final_atom_positions'] = atom37_pred_positions  # (N, 37, 3)
     ret['final_atom_mask'] = atom37_mask  # (N, 37)
     ret['final_rigids'] = ret['traj'][-1]
 
     ret['act'] = output['act']
 
-    if self.compute_loss:
+    if compute_loss:
       return ret
     else:
       no_loss_features = ['final_atom_positions', 'final_atom_mask', 'act']
@@ -629,15 +629,13 @@ class StructureModule(hk.Module):
            batch: Mapping[str, Any]
            ) -> Dict[str, Any]:
 
-    # raise NotImplementedError(
-    #     'This function should be called on a batch with reordered chains (see '
-    #     'Evans et al (2021) Section 7.3. Multi-Chain Permutation Alignment.')
+    raise NotImplementedError(
+        'This function should be called on a batch with reordered chains (see '
+        'Evans et al (2021) Section 7.3. Multi-Chain Permutation Alignment.')
 
     ret = {'loss': 0.}
 
     ret['metrics'] = {}
-
-    # print('zczczczczczcz')
 
     aatype = batch['aatype']
     all_atom_positions = batch['all_atom_positions']
@@ -791,7 +789,7 @@ def backbone_loss(gt_rigid: geometry.Rigid3Array,
   loss_fn = functools.partial(
       all_atom_multimer.frame_aligned_point_error,
       l1_clamp_distance=config.atom_clamp_distance,
-      length_scale=config.loss_unit_distance)
+      loss_unit_distance=config.loss_unit_distance)
 
   loss_fn = jax.vmap(loss_fn, (0, None, None, 0, None, None, None))
   fape = loss_fn(target_rigid, gt_rigid, gt_frames_mask,
@@ -825,7 +823,7 @@ def compute_frames(
   alt_gt_frames = frames_batch['rigidgroups_alt_gt_frames']
   use_alt = use_alt[:, None]
 
-  renamed_gt_frames = jax.tree_map(
+  renamed_gt_frames = jax.tree_multimap(
       lambda x, y: (1. - use_alt) * x + use_alt * y, gt_frames, alt_gt_frames)
 
   return renamed_gt_frames, frames_batch['rigidgroups_gt_exists']
@@ -1162,3 +1160,4 @@ class MultiRigidSidechain(hk.Module):
         'frames': all_frames_to_global,  # geometry.Rigid3Array (N, 8)
     })
     return outputs
+
