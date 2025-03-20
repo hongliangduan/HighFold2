@@ -109,6 +109,7 @@ def load_models_and_params(
                 model_config.model.recycle_early_stop_tolerance = recycle_early_stop_tolerance
             
             # get model runner
+            data_dir = 'fine_tuning'
             params = data.get_model_haiku_params(
                 model_name="model_" + str(model_number) + model_suffix,
                 data_dir=str(data_dir), fuse=use_fuse)

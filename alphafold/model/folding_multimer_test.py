@@ -427,7 +427,7 @@ class FoldIteration(hk.Module):
     safe_key, *sub_keys = safe_key.split(3)
     sub_keys = iter(sub_keys)
     act = safe_dropout_fn(act, next(sub_keys))
-    act = hk.LayerNorm(
+    act = common_modules.LayerNorm(
         axis=-1,
         create_scale=True,
         create_offset=True,
@@ -448,7 +448,7 @@ class FoldIteration(hk.Module):
         act = jax.nn.relu(act)
     act += input_act
     act = safe_dropout_fn(act, next(sub_keys))
-    act = hk.LayerNorm(
+    act = common_modules.LayerNorm(
         axis=-1,
         create_scale=True,
         create_offset=True,
@@ -500,7 +500,7 @@ def generate_monomer_rigids(representations: Mapping[str, jnp.ndarray],
   """
   c = config
   sequence_mask = batch['seq_mask'][:, None]
-  act = hk.LayerNorm(
+  act = common_modules.LayerNorm(
       axis=-1, create_scale=True, create_offset=True, name='single_layer_norm')(
           representations['single'])
 
@@ -523,31 +523,28 @@ def generate_monomer_rigids(representations: Mapping[str, jnp.ndarray],
           rigid
   }
 
-  act_2d = hk.LayerNorm(
+  act_2d = common_modules.LayerNorm(
       axis=-1,
       create_scale=True,
       create_offset=True,
       name='pair_layer_norm')(
           representations['pair'])
 
-  safe_keys = safe_key.split(c.num_layer)
   outputs = []
-  for key in safe_keys:
+  def fold_iter(act, key):
+      act, out = fold_iteration(
+          act,
+          initial_act=initial_act,
+          static_feat_2d=act_2d,
+          aatype=batch['aatype'],
+          safe_key=prng.SafeKey(key),
+          sequence_mask=sequence_mask,
+          update_rigid=True,
+          is_training=is_training)
+      return act, out
 
-    activations, output = fold_iteration(
-        activations,
-        initial_act=initial_act,
-        static_feat_2d=act_2d,
-        aatype=batch['aatype'],
-        safe_key=key,
-        sequence_mask=sequence_mask,
-        update_rigid=True,
-        is_training=is_training,
-        )
-    outputs.append(output)
-
-  output = jax.tree_multimap(lambda *x: jnp.stack(x), *outputs)
-  # Pass along for LDDT-Head.
+  keys = jax.random.split(safe_key.get(), c.num_layer)
+  activations, output = hk.scan(fold_iter, activations, keys)
   output['act'] = activations['act']
 
   return output
@@ -562,10 +559,12 @@ class StructureModule(hk.Module):
   def __init__(self,
                config: ml_collections.ConfigDict,
                global_config: ml_collections.ConfigDict,
+               compute_loss=False,
                name: str = 'structure_module'):
     super().__init__(name=name)
     self.config = config
     self.global_config = global_config
+    self.compute_loss = compute_loss
 
   def __call__(self,
                representations: Mapping[str, jnp.ndarray],
@@ -600,6 +599,7 @@ class StructureModule(hk.Module):
 
     aatype = batch['aatype']
     seq_mask = batch['seq_mask']
+    
 
     atom14_pred_mask = all_atom_multimer.get_atom14_mask(
         aatype) * seq_mask[:, None]
@@ -610,14 +610,14 @@ class StructureModule(hk.Module):
     atom37_mask = all_atom_multimer.get_atom37_mask(aatype) * seq_mask[:, None]
     atom37_pred_positions = all_atom_multimer.atom14_to_atom37(
         atom14_pred_positions, aatype)
-    atom37_pred_positions *= atom37_mask[:, :, None]
+    atom37_pred_positions *= atom37_mask[:, :, None] #zc
     ret['final_atom_positions'] = atom37_pred_positions  # (N, 37, 3)
     ret['final_atom_mask'] = atom37_mask  # (N, 37)
     ret['final_rigids'] = ret['traj'][-1]
 
     ret['act'] = output['act']
 
-    if compute_loss:
+    if self.compute_loss:
       return ret
     else:
       no_loss_features = ['final_atom_positions', 'final_atom_mask', 'act']
@@ -632,121 +632,6 @@ class StructureModule(hk.Module):
     raise NotImplementedError(
         'This function should be called on a batch with reordered chains (see '
         'Evans et al (2021) Section 7.3. Multi-Chain Permutation Alignment.')
-
-    ret = {'loss': 0.}
-
-    ret['metrics'] = {}
-
-    aatype = batch['aatype']
-    all_atom_positions = batch['all_atom_positions']
-    all_atom_positions = geometry.Vec3Array.from_array(all_atom_positions)
-    all_atom_mask = batch['all_atom_mask']
-    seq_mask = batch['seq_mask']
-    residue_index = batch['residue_index']
-
-    gt_rigid, gt_affine_mask = make_backbone_affine(all_atom_positions,
-                                                    all_atom_mask,
-                                                    aatype)
-
-    chi_angles, chi_mask = all_atom_multimer.compute_chi_angles(
-        all_atom_positions, all_atom_mask, aatype)
-
-    pred_mask = all_atom_multimer.get_atom14_mask(aatype)
-    pred_mask *= seq_mask[:, None]
-    pred_positions = value['final_atom14_positions']
-    pred_positions = geometry.Vec3Array.from_array(pred_positions)
-
-    gt_positions, gt_mask, alt_naming_is_better = compute_atom14_gt(
-        aatype, all_atom_positions, all_atom_mask, pred_positions)
-
-    violations = find_structural_violations(
-        aatype=aatype,
-        residue_index=residue_index,
-        mask=pred_mask,
-        pred_positions=pred_positions,
-        config=self.config,
-        asym_id=batch['asym_id'])
-
-    sidechains = value['sidechains']
-
-    gt_chi_angles = get_renamed_chi_angles(aatype, chi_angles,
-                                           alt_naming_is_better)
-
-    # Several violation metrics:
-    violation_metrics = compute_violation_metrics(
-        residue_index=residue_index,
-        mask=pred_mask,
-        seq_mask=seq_mask,
-        pred_positions=pred_positions,
-        violations=violations)
-    ret['metrics'].update(violation_metrics)
-
-    target_rigid = geometry.Rigid3Array.from_array(value['traj'])
-    gt_frames_mask = gt_affine_mask
-
-    # Split the loss into within-chain and between-chain components.
-    intra_chain_mask = batch['asym_id'][:, None] == batch['asym_id'][None, :]
-    intra_chain_bb_loss, intra_chain_fape = backbone_loss(
-        gt_rigid=gt_rigid,
-        gt_frames_mask=gt_frames_mask,
-        gt_positions_mask=gt_affine_mask,
-        target_rigid=target_rigid,
-        config=self.config.intra_chain_fape,
-        pair_mask=intra_chain_mask)
-    interface_bb_loss, interface_fape = backbone_loss(
-        gt_rigid=gt_rigid,
-        gt_frames_mask=gt_frames_mask,
-        gt_positions_mask=gt_affine_mask,
-        target_rigid=target_rigid,
-        config=self.config.interface_fape,
-        pair_mask=1. - intra_chain_mask)
-
-    bb_loss = intra_chain_bb_loss + interface_bb_loss
-    ret['fape'] = intra_chain_fape + interface_fape
-    ret['bb_loss'] = bb_loss
-    ret['loss'] += bb_loss
-
-    pred_frames = geometry.Rigid3Array.from_array(sidechains['frames'])
-    pred_positions = geometry.Vec3Array.from_array(sidechains['atom_pos'])
-    gt_sc_frames, gt_sc_frames_mask = compute_frames(
-        aatype=aatype,
-        all_atom_positions=all_atom_positions,
-        all_atom_mask=all_atom_mask,
-        use_alt=alt_naming_is_better)
-
-    sc_loss = sidechain_loss(
-        gt_frames=gt_sc_frames,
-        gt_frames_mask=gt_sc_frames_mask,
-        gt_positions=gt_positions,
-        gt_mask=gt_mask,
-        pred_frames=pred_frames,
-        pred_positions=pred_positions,
-        config=self.config)
-
-    ret['loss'] = ((1 - self.config.sidechain.weight_frac) * ret['loss'] +
-                   self.config.sidechain.weight_frac * sc_loss['loss'])
-    ret['sidechain_fape'] = sc_loss['fape']
-
-    unnormed_angles = sidechains['unnormalized_angles_sin_cos']
-    pred_angles = sidechains['angles_sin_cos']
-
-    sup_chi_loss, ret['chi_loss'], ret[
-        'angle_norm_loss'] = supervised_chi_loss(
-            sequence_mask=seq_mask,
-            target_chi_mask=chi_mask,
-            target_chi_angles=gt_chi_angles,
-            aatype=aatype,
-            pred_angles=pred_angles,
-            unnormed_angles=unnormed_angles,
-            config=self.config)
-    ret['loss'] += sup_chi_loss
-
-    if self.config.structural_violation_loss_weight:
-
-      ret['loss'] += structural_violation_loss(
-          mask=pred_mask, violations=violations, config=self.config)
-
-    return ret
 
 
 def compute_atom14_gt(
@@ -789,7 +674,7 @@ def backbone_loss(gt_rigid: geometry.Rigid3Array,
   loss_fn = functools.partial(
       all_atom_multimer.frame_aligned_point_error,
       l1_clamp_distance=config.atom_clamp_distance,
-      loss_unit_distance=config.loss_unit_distance)
+      length_scale=config.loss_unit_distance)
 
   loss_fn = jax.vmap(loss_fn, (0, None, None, 0, None, None, None))
   fape = loss_fn(target_rigid, gt_rigid, gt_frames_mask,
@@ -823,7 +708,7 @@ def compute_frames(
   alt_gt_frames = frames_batch['rigidgroups_alt_gt_frames']
   use_alt = use_alt[:, None]
 
-  renamed_gt_frames = jax.tree_multimap(
+  renamed_gt_frames = jax.tree_map(
       lambda x, y: (1. - use_alt) * x + use_alt * y, gt_frames, alt_gt_frames)
 
   return renamed_gt_frames, frames_batch['rigidgroups_gt_exists']
@@ -1160,4 +1045,3 @@ class MultiRigidSidechain(hk.Module):
         'frames': all_frames_to_global,  # geometry.Rigid3Array (N, 8)
     })
     return outputs
-

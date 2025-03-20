@@ -67,6 +67,9 @@ def fix_pdb(pdbfile, alterations_info, dist_cst_ss, disulf, aa_names, nc, cp):
     f.write('loadAmberPrep ./forcefield/AIB.prepin\n')
     f.write('loadAmberParams ./forcefield/AIB.frcmod\n')
 
+    f.write('loadAmberPrep ./forcefield/ALC.prepin\n')
+    f.write('loadAmberParams ./forcefield/ALC.frcmod\n')
+
     f.write('loadAmberPrep ./forcefield/ALY.prepin\n')
     f.write('loadAmberParams ./forcefield/ALY.frcmod\n')
 
@@ -82,14 +85,8 @@ def fix_pdb(pdbfile, alterations_info, dist_cst_ss, disulf, aa_names, nc, cp):
     f.write('loadAmberPrep ./forcefield/DPR.prepin\n')
     f.write('loadAmberParams ./forcefield/DPR.frcmod\n')
 
-    f.write('loadAmberPrep ./forcefield/HOX.prepin\n')
-    f.write('loadAmberParams ./forcefield/HOX.frcmod\n')
-
     f.write('loadAmberPrep ./forcefield/HYP.prepin\n')
     f.write('loadAmberParams ./forcefield/HYP.frcmod\n')
-
-    f.write('loadAmberPrep ./forcefield/HZP.prepin\n')
-    f.write('loadAmberParams ./forcefield/HZP.frcmod\n')
 
     f.write('loadAmberPrep ./forcefield/M3L.prepin\n')
     f.write('loadAmberParams ./forcefield/M3L.frcmod\n')
@@ -99,6 +96,9 @@ def fix_pdb(pdbfile, alterations_info, dist_cst_ss, disulf, aa_names, nc, cp):
 
     f.write('loadAmberPrep ./forcefield/MLZ.prepin\n')
     f.write('loadAmberParams ./forcefield/MLZ.frcmod\n')
+
+    f.write('loadAmberPrep ./forcefield/MSE.prepin\n')
+    f.write('loadAmberParams ./forcefield/MSE.frcmod\n')
 
     f.write('loadAmberPrep ./forcefield/NLE.prepin\n')
     f.write('loadAmberParams ./forcefield/NLE.frcmod\n')
@@ -124,8 +124,12 @@ def fix_pdb(pdbfile, alterations_info, dist_cst_ss, disulf, aa_names, nc, cp):
     f.write('loadAmberPrep ./forcefield/TPO.prepin\n')
     f.write('loadAmberParams ./forcefield/TPO.frcmod\n')
     if cp:
-      f.write(temp_str)
-      f.write('mol = loadPDBusingseq tmp.pdb temp\n')
+      if aa_names[-1] == 'NH2':
+        f.write(temp_str.replace('NH2', 'NHE'))
+        f.write('mol = loadPDBusingseq tmp.pdb temp\n')
+      else:
+        f.write(temp_str)
+        f.write('mol = loadPDBusingseq tmp.pdb temp\n')
       for i in disulf:
         f.write(f'bond mol.{i[0]+1}.SG mol.{i[1]+1}.SG\n')
       for i in nc:

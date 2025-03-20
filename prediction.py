@@ -29,6 +29,7 @@ from io import StringIO
 import importlib_metadata
 import numpy as np
 import pandas
+import haiku as hk
 
 try:
     import alphafold
@@ -77,7 +78,300 @@ import jax
 import jax.numpy as jnp
 
 logging.getLogger('jax._src.lib.xla_bridge').addFilter(lambda _: False)
+logging.getLogger('parmed').setLevel(logging.WARNING)
 
+# zc
+from rdkit import Chem
+import copy
+class PoolLayer(hk.Module):
+    def __init__(self, head=8):
+        super(PoolLayer, self).__init__()
+        # self.bond_qury = hk.Sequential([
+        #     hk.Linear(6),
+        #     jax.nn.relu,
+        #     hk.Linear(6),
+        #     jax.nn.relu,
+        #     hk.Linear(6),
+        # ])
+        # self.bond_key = hk.Sequential([
+        #     hk.Linear(6),
+        #     jax.nn.relu,
+        #     hk.Linear(6),
+        #     jax.nn.relu,
+        #     hk.Linear(6),
+        # ])
+        # self.bond_value = hk.Sequential([
+        #     hk.Linear(6),
+        #     jax.nn.relu,
+        #     hk.Linear(6),
+        #     jax.nn.relu,
+        #     hk.Linear(6),
+        # ])
+        self.head = head
+        self.layernorm = hk.LayerNorm(axis=1, create_scale=True, create_offset=True)
+    
+        self.linear1 = hk.Sequential([
+            hk.Linear(6),
+            jax.nn.relu,
+            hk.Linear(6),
+            jax.nn.relu,
+            hk.Linear(1),
+        ])
+        self.linear2 = hk.Sequential([
+            hk.Linear(1),
+            jax.nn.relu,
+            hk.Linear(64),
+            jax.nn.relu,
+            hk.Linear(128),
+        ])
+        self.atom_qury = hk.Sequential([
+            hk.Linear(16),
+            jax.nn.relu,
+            hk.Linear(24),
+            jax.nn.relu,
+            hk.Linear(32),
+        ])
+        self.atom_key = hk.Sequential([
+            hk.Linear(16),
+            jax.nn.relu,
+            hk.Linear(24),
+            jax.nn.relu,
+            hk.Linear(32),
+        ])
+        self.atom_value = hk.Sequential([
+            hk.Linear(16),
+            jax.nn.relu,
+            hk.Linear(24),
+            jax.nn.relu,
+            hk.Linear(32),
+        ])
+        self.linear3 = hk.Sequential([
+            hk.Linear(24),
+            jax.nn.relu,
+            hk.Linear(16),
+            jax.nn.relu,
+            hk.Linear(11),
+        ])
+        self.linear4 = hk.Sequential([
+            hk.Linear(11),
+            jax.nn.relu,
+            hk.Linear(11),
+            jax.nn.relu,
+            hk.Linear(21),
+        ])
+
+    def __call__(self, bond_feat, atom_feat, M):
+        F = (1.0 - M + 1e-6) / (M - 1e-6)
+        
+        # N, N, n = bond_feat.shape
+        # bond_feat = jnp.reshape(bond_feat, (N*N, 6))
+        # bond_qury = self.bond_qury(bond_feat) # [N*N, 6]
+        # bond_key = self.bond_key(bond_feat) # [N*N, 6]
+        # bond_value = self.bond_value(bond_feat) # [N*N, 6]
+        # score = jax.nn.softmax(jnp.matmul(bond_qury, bond_key.T) / jnp.sqrt(6)) # [N*N, N*N]
+        # bond = jnp.matmul(score, bond_value) # [N*N, 6]
+        # bond = jnp.reshape(bond, (N, N, 6))
+        
+        bond = self.linear1(bond_feat) # [N, N, 1]
+        Ms_bond1 = jax.nn.softmax(jnp.transpose(bond, (0, 2, 1)) + F[:, :, None], axis=0)  # [N, Nr, N]
+        bond_pool = jnp.matmul(bond.transpose(0, 2, 1), Ms_bond1.transpose(0, 2, 1))  # [N, 1, Nr]
+
+        Ms_bond2 = jax.nn.softmax(bond_pool + F[:, :, None], axis=0) # [N, Nr, Nr]
+        bond_pool = jnp.matmul(bond_pool.transpose(2, 1, 0), Ms_bond2.transpose(1, 0, 2)) # [Nr, 1, Nr]
+        bond_pool = self.linear2(bond_pool.transpose(0, 2, 1)) # [Nr, Nr, 1]
+        # bond_pool = jnp.squeeze(bond_pool, axis=2)
+
+        x_clone = atom_feat
+        atom_qury = self.atom_qury(atom_feat) # [N, 32]
+        atom_key = self.atom_key(atom_feat) # [N, 32]
+        atom_value = self.atom_value(atom_feat) # [N, 32]
+
+        head_dim = atom_qury.shape[-1] // self.head
+        Q = atom_qury.reshape(-1, self.head, head_dim).transpose(1, 0, 2)  # [head, N, head_dim]
+        K = atom_key.reshape(-1, self.head, head_dim).transpose(1, 0, 2)  # [head, N, head_dim]
+        V = atom_value.reshape(-1, self.head, head_dim).transpose(1, 0, 2)  # [head, N, head_dim]
+        
+        score = jax.nn.softmax(jnp.matmul(Q, K.transpose(0, 2, 1)) / jnp.sqrt(head_dim)) # [head, N, N]
+        atom = jnp.matmul(score, V) # [head, N, head_dim]
+        atom = atom.transpose(1, 0, 2).reshape(-1, atom_qury.shape[-1])  # [N, 32]
+        atom = self.linear3(atom) # [N, 11]
+        # atom = atom + x_clone
+        # atom = self.layernorm(atom)
+        atom = self.linear4(atom)
+        Ms_atom = jax.nn.softmax(atom[:, None, :] + F[:, :, None], axis=0) # [N,Nr,21]
+        atom_pool = jnp.matmul(atom.T[:, None, :], Ms_atom.transpose(2, 0, 1)) # [21,1,Nr]
+        atom_pool = jnp.squeeze(atom_pool, axis=1).T
+        return bond_pool, atom_pool
+
+def pool_fn(bond_feat, atom_feat, M):
+    model = PoolLayer()
+    return model(bond_feat, atom_feat, M)
+
+smiles_dict = {'GLY': 'NCC(=O)',
+ 'THR': 'N[C@@]([H])([C@]([H])(O)C)C(=O)',
+ 'LYS': 'N[C@@]([H])(CCCCN)C(=O)',
+ 'VAL': 'N[C@@]([H])(C(C)C)C(=O)',
+ 'HIS': 'N[C@@]([H])(CC1=CN=C-N1)C(=O)',
+ 'ARG': 'N[C@@]([H])(CCCNC(=N)N)C(=O)',
+ 'ALA': 'N[C@@]([H])(C)C(=O)',
+ 'LEU': 'N[C@@]([H])(CC(C)C)C(=O)',
+ 'ILE': 'N[C@@]([H])([C@]([H])(CC)C)C(=O)',
+ 'MET': 'N[C@@]([H])(CCSC)C(=O)',
+ 'PHE': 'N[C@@]([H])(Cc1ccccc1)C(=O)',
+ 'TRP': 'N[C@@]([H])(CC(=CN2)C1=C2C=CC=C1)C(=O)',
+ 'PRO': 'N1[C@@]([H])(CCC1)C(=O)',
+ 'SER': 'N[C@@]([H])(CO)C(=O)',
+ 'CYS': 'N[C@@]([H])(CS)C(=O)',
+ 'TYR': 'N[C@@]([H])(Cc1ccc(O)cc1)C(=O)',
+ 'ASN': 'N[C@@]([H])(CC(=O)N)C(=O)',
+ 'GLN': 'N[C@@]([H])(CCC(=O)N)C(=O)',
+ 'ASP': 'N[C@@]([H])(CC(=O)O)C(=O)',
+ 'GLU': 'N[C@@]([H])(CCC(=O)O)C(=O)',
+ 'CSO': 'N[C@@]([H])(CSO)C(=O)',
+ 'NVA': 'N[C@@]([H])(CCC)C(=O)',
+ 'NLE': 'N[C@@]([H])(CCCC)C(=O)',
+ 'AIB': 'NC(C)(C)C(=O)',
+ 'MLZ': 'N[C@@]([H])(CCCCNC)C(=O)',
+ 'PTR': 'N[C@@]([H])(Cc1ccc(OP(O)(=O)O)cc1)C(=O)',
+ 'HYP': 'N1[C@@]([H])(CC(=O)C1)C(=O)',
+ 'SEP': 'N[C@@]([H])(COP(O)(=O)O)C(=O)',
+ 'TPO': 'N[C@@]([H])(C(C)OP(O)(=O)O)C(=O)',
+ 'MLY': 'N[C@@]([H])(CCCCN(C)C)C(=O)',
+ 'ALY': 'N[C@@]([H])(CCCCNC(=O)C)C(=O)',
+ 'ESC': 'N[C@@]([H])(CCSCC)C(=O)',
+ 'PCA': 'N1[C@@]([H])(CCC1(=O))C(=O)',
+ 'M3L': 'N[C@@]([H])(CCCC[N+](C)(C)C)C(=O)',
+ 'ABA': 'N[C@@]([H])(CC)C(=O)',
+ 'DA2': 'N[C@@]([H])(CCCNC(N)N(C)C)C(=O)',
+ '2MR': 'N[C@@]([H])(CCCNC(NC)NC)C(=O)',
+ 'ALC': 'N[C@@]([H])(C(CCC1)(CC1)C)C(=O)',
+ 'HZP': 'N1[C@@]([H])(CC(=O)C1)C(=O)',
+ 'HOX': 'N[C@@]([H])(Cc1ccc(N)cc1)C(=O)',
+ 'PRK': 'N[C@@]([H])(CCCCNC(=O)CC)C(=O)',
+ 'DAL': 'N[C@]([H])(C)C(=O)',
+ 'DHI': 'N[C@]([H])(CC1=CN=C-N1)C(=O)',
+ 'DPR': 'N1[C@]([H])(CCC1)C(=O)',
+ 'DVA': 'N[C@]([H])(C(C)C)C(=O)',
+ 'DSN': 'N[C@]([H])(CO)C(=O)',
+ 'DGN': 'N[C@]([H])(CCC(=O)N)C(=O)',
+ 'DTY': 'N[C@]([H])(Cc1ccc(O)cc1)C(=O)',
+ 'DAS': 'N[C@]([H])(CC(=O)O)C(=O)',
+ 'DLE': 'N[C@]([H])(CC(C)C)C(=O)',
+ 'DTR': 'N[C@]([H])(CC(=CN2)C1=C2C=CC=C1)C(=O)',
+ 'DPN': 'N[C@]([H])(Cc1ccccc1)C(=O)',
+ 'DGL': 'N[C@]([H])(CCC(=O)O)C(=O)',
+ 'DAR': 'N[C@]([H])(CCCNC(=N)N)C(=O)',
+ 'DIL': 'N[C@]([H])([C@]([H])(CC)C)C(=O)',
+ 'MSE': 'N[C@@]([H])(CC[Se]C)C(=O)',
+ 'ORN': 'N[C@@]([H])(CCCN)C(=O)',
+ 'NH2': 'N',
+ }
+
+def bonds_from_smiles(smiles_string, atom_encoding):
+    """Get all bonds from the smiles
+    """
+    m = Chem.MolFromSmiles(smiles_string)
+
+    bond_encoding = {'SINGLE':1, 'DOUBLE':2, 'TRIPLE':3, 'AROMATIC':4, 'IONIC':5}
+
+    #Go through the smiles and assign the atom types and a bond matrix
+    atoms = []
+    atom_types = []
+    num_atoms = len(m.GetAtoms())
+    bond_matrix = np.zeros((num_atoms, num_atoms))
+
+
+    #Get the atom types
+    for atom in m.GetAtoms():
+        atoms.append(atom.GetSymbol())
+        atom_types.append(atom_encoding.get(atom.GetSymbol(),10))
+        #Get neighbours and assign bonds
+        for nb in atom.GetNeighbors():
+            for bond in nb.GetBonds():
+                bond_type = bond_encoding.get(str(bond.GetBondType()), 6)
+                si = bond.GetBeginAtomIdx()
+                ei = bond.GetEndAtomIdx()
+                bond_matrix[si,ei] = bond_type
+                bond_matrix[ei,si] = bond_type
+
+    #Get a distance matrix
+    #Add Hs
+    # m = Chem.AddHs(m)
+    #Embed in 3D
+    # AllChem.EmbedMolecule(m, maxAttempts=500)
+    #Remove Hs to fit other dimensions (will cause error if mismatch on mult with has_bond)
+    # m = Chem.RemoveHs(m)
+    # D=AllChem.Get3DDistanceMatrix(m)
+    #Get the bond positions
+    has_bond = copy.deepcopy(bond_matrix)
+    has_bond[has_bond>0]=1
+
+    # return np.array(atom_types), np.array(atoms), bond_matrix, D*has_bond, has_bond
+    return np.array(atom_types), np.array(atoms), bond_matrix, has_bond
+
+def get_atom_features(smiles_string):
+
+    input_smiles = smiles_string
+    #Atom encoding - no hydrogens
+    atom_encoding = {'B':0, 'C':1, 'F':2, 'I':3, 'N':4, 'O':5, 'P':6, 'S':7,'Br':8, 'Cl':9, #Individual encoding
+                    'As':10, 'Co':10, 'Fe':10, 'Mg':10, 'Pt':10, 'Rh':10, 'Ru':10, 'Se':10, 'Si':10, 'Te':10, 'V':10, 'Zn':10 #Joint (rare)
+                    }
+
+    #Get the atom types and bonds
+    # atom_types, atoms, bond_types, bond_lengths, bond_mask = bonds_from_smiles(input_smiles, atom_encoding)
+    atom_types, atoms, bond_types, bond_mask = bonds_from_smiles(input_smiles, atom_encoding)
+
+    ligand_feats = {}
+    ligand_feats['atoms'] = atoms
+    ligand_feats['atom_types'] = atom_types
+    ligand_feats['bond_types'] = bond_types
+    # ligand_inp_feats['bond_lengths'] = bond_lengths
+    ligand_feats['bond_mask'] = bond_mask
+    return ligand_feats
+
+def get_bond_feat(ligand_feats):
+    atom_len = len(ligand_feats['atoms'])
+    # bond_feat = np.zeros((atom_len,atom_len,6))
+    # bond_feat[:,:,:5] = (np.eye(6)[np.array(ligand_feats['bond_types'],dtype=int)])[:,:,1:]
+    # bond_feat[:,:,5] = ligand_feats['bond_mask']
+    # or this way
+    bond_feat = (np.eye(6)[np.array(ligand_feats['bond_types'],dtype=int)])
+    return bond_feat
+def get_atom_feat(ligand_feats):
+    atom_types = ligand_feats['atom_types']
+    atom_feat = np.zeros((atom_types.size, 11))
+    atom_feat[np.arange(atom_types.size), atom_types] = 1
+    return atom_feat
+    
+
+def get_mask(ligand_feats):
+    array = ligand_feats['atoms']
+    split_indices = [0]
+    sequence = ['C', 'O', 'N']
+    seq_len = len(sequence)
+    i = 0
+
+    while i <= len(array) - seq_len:
+        if list(array[i:i + seq_len]) == sequence and np.count_nonzero(ligand_feats['bond_mask'][i+seq_len-1]) != 1:
+            split_indices.append(i + seq_len - 1)
+            i += seq_len
+        else:
+            i += 1
+
+    new_array = np.zeros(len(array), dtype=int)
+    for i in range(len(split_indices)):
+        if i == len(split_indices) - 1:
+            start = split_indices[i]
+            new_array[start:] = i
+        else:
+            start = split_indices[i]
+            end = split_indices[i + 1]
+            new_array[start:end] = i
+
+    num_classes = np.max(new_array) + 1
+    one_hot_encoded = np.eye(num_classes)[new_array]
+    return one_hot_encoded
+#zc
 
 def patch_openmm():
     from simtk.openmm import app
@@ -352,7 +646,7 @@ def pad_input(
     return input_fix
 
 
-def relax_me(pdb_filename=None, pdb_lines=None, pdb_obj=None, use_gpu=False):
+def relax_me(dist_cst_ss=[], pdb_filename=None, pdb_lines=None, pdb_obj=None, use_gpu=False, disulf=None, aa_names=None, nc=None,cp=None):
     if "relax" not in dir():
         patch_openmm()
         from alphafold.common import residue_constants
@@ -364,12 +658,17 @@ def relax_me(pdb_filename=None, pdb_lines=None, pdb_obj=None, use_gpu=False):
         pdb_obj = protein.from_pdb_string(pdb_lines)
 
     amber_relaxer = relax.AmberRelaxation(
+        dist_cst_ss=dist_cst_ss,
         max_iterations=0,
         tolerance=2.39,
         stiffness=10.0,
         exclude_residues=[],
         max_outer_iterations=3,
-        use_gpu=use_gpu)
+        use_gpu=use_gpu,
+        disulf=disulf,
+        aa_names=aa_names,
+        nc=nc,
+        cp=cp)
 
     relaxed_pdb_lines, _, _ = amber_relaxer.process(prot=pdb_obj)
     return relaxed_pdb_lines
@@ -394,6 +693,9 @@ class file_manager:
 
 
 def predict_structure(
+        args_index_ss,
+        dist_cst_ss: List[List[int]],
+        index_ss: Dict,
         prefix: str,
         result_dir: Path,
         feature_dict: Dict[str, Any],
@@ -414,6 +716,8 @@ def predict_structure(
         save_single_representations: bool = False,
         save_pair_representations: bool = False,
         save_recycles: bool = False,
+        flag_nc: list = None,
+        cp: list = None,
 ):
     """Predicts structure using AlphaFold for the given sequence."""
 
@@ -430,6 +734,54 @@ def predict_structure(
 
         # iterate through models
         for model_num, (model_name, model_runner, params) in enumerate(model_runner_and_params):
+            pool_params, params = hk.data_structures.partition(lambda m, n, p: m[:9] != "alphafold", params)
+            pool = hk.transform(pool_fn, apply_rng=True)
+            indices = [i for i, arr in enumerate(feature_dict['chain_length']) if arr < 50]
+            ligand_feats_dict = {}
+            for index in indices:
+                end = 0
+                for i in range(index+1):
+                    end += feature_dict['chain_length'][i]
+                start = end - feature_dict['chain_length'][index]
+                pep_index = feature_dict['aatype']
+                pep_index = feature_dict['aatype'][start:end]
+                pep_chara = [residue_constants.resnames[i] for i in pep_index]
+                ligand_smiles = ''
+                for i in pep_chara:
+                    ligand_smiles += smiles_dict[i]
+                if pep_chara[-1] != 'NH2':
+                    ligand_smiles += 'O'
+                ligand_feats = get_atom_features(ligand_smiles)
+                bond_feat = get_bond_feat(ligand_feats)
+                atom_feat = get_atom_feat(ligand_feats)
+                mask = get_mask(ligand_feats)
+                if pep_chara[-1] == 'NH2':
+                    new_mask = np.zeros((mask.shape[0], mask.shape[1] + 1))
+                    new_mask[:, :mask.shape[1]] = mask
+                    new_mask[-1, -1] = 1
+                    new_mask[-1, -2] = 0
+                    mask = new_mask
+                ligand_feats_dict[index] = {'atom_feat':atom_feat, 'bond_feat':bond_feat, 'mask':mask, 'start_and_end':[start, end]}
+            feature_dict['ligand_feats_dict'] = ligand_feats_dict
+            rng = jax.random.PRNGKey(random_seed)
+            L = len(feature_dict['aatype'])
+            bond_rep_plus_init = jnp.zeros((L, L, 128), dtype = 'bfloat16')
+            atom_rep_plus_init = jnp.zeros((L, 21), dtype = 'bfloat16')
+            bond_rep_plus = bond_rep_plus_init
+            atom_rep_plus = atom_rep_plus_init
+            for key in feature_dict['ligand_feats_dict']:
+                start, end = feature_dict['ligand_feats_dict'][key]['start_and_end']
+                bond_feat = feature_dict['ligand_feats_dict'][key]['bond_feat']
+                atom_feat = feature_dict['ligand_feats_dict'][key]['atom_feat']
+                mask = feature_dict['ligand_feats_dict'][key]['mask']
+                bond_rep, atom_rep = jax.jit(pool.apply)(pool_params, rng, bond_feat, atom_feat, mask)
+                bond_rep_plus = bond_rep_plus.at[start:end,start:end,:].set(bond_rep.astype('bfloat16'))
+                # bond_rep_plus = bound_rep_plus_init.at[start:end,start:end,0].set(bond_rep.astype('bfloat16'))
+                atom_rep_plus = atom_rep_plus.at[start:end,:].set(atom_rep.astype('bfloat16'))
+            feature_dict['bond_rep_plus'] = bond_rep_plus
+            feature_dict['atom_rep_plus'] = atom_rep_plus
+            del feature_dict['ligand_feats_dict']
+
 
             # swap params to avoid recompiling
             model_runner.params = params
@@ -442,6 +794,7 @@ def predict_structure(
                     # TODO: add pad_input_mulitmer()
                     input_features = feature_dict
                     input_features["asym_id"] = input_features["asym_id"] - input_features["asym_id"][..., 0]
+                    # print(input_features.keys())
             else:
                 if model_num == 0:
                     input_features = model_runner.process_features(feature_dict, random_seed=seed)
@@ -499,7 +852,6 @@ def predict_structure(
             ########################
             # parse results
             ########################
-
             # summary metrics
             mean_scores.append(result["ranking_confidence"])
             if recycles == 0: result.pop("tol", None)
@@ -586,9 +938,38 @@ def predict_structure(
         # save relaxed pdb
         if n < num_relax:
             start = time.time()
-            pdb_lines = relax_me(pdb_lines=unrelaxed_pdb_lines[key], use_gpu=use_gpu_relax)
+            #zc
+            global_indices = []
+            start_index = 0
+            # for chain_key, positions in index_ss.items():
+            for i in range(len(args_index_ss)):
+                # chain_num = int(chain_key[1:])
+                chain_num = args_index_ss[i][0]
+                positions = [(args_index_ss[i][1], args_index_ss[i][2])]
+                start_index = sum(feature_dict['chain_length'][:chain_num])
+                global_indices.append([start_index + pos for pos in positions[0]])
+            aa_names = [residue_constants.resnames[index] for index in feature_dict['aatype']]
+
+            cyclic_peptide_indices = []
+            start_index = 0
+            for i, is_cyclic in enumerate(flag_nc):
+                if is_cyclic == 1:
+                    head_index = start_index
+                    tail_index = start_index + feature_dict['chain_length'][i] - 1
+                    cyclic_peptide_indices.append((head_index, tail_index))
+                start_index += feature_dict['chain_length'][i]
+            #zc
+            pdb_lines = relax_me(dist_cst_ss=dist_cst_ss, pdb_lines=unrelaxed_pdb_lines[key], use_gpu=use_gpu_relax, disulf=global_indices, aa_names=aa_names, nc=cyclic_peptide_indices, cp=cp)
             files.get("relaxed", "pdb").write_text(pdb_lines)
             logger.info(f"Relaxation took {(time.time() - start):.1f}s")
+
+            # zc
+            os.remove("tmp.pdb")
+            os.remove("leap.in")
+            os.remove("leap.log")
+            os.remove("system.inpcrd")
+            os.remove("system.prmtop")
+            # zc
 
         # rename files to include rank
         new_tag = f"rank_{(n + 1):03d}_{tag}"
@@ -1002,15 +1383,17 @@ def get_offset_multicyc(
         index_ss: Dict[List[Tuple[int]]],
         feat: Dict[str, ndarray]
 ):
-    print(feat['residue_index'])
-    print(flag_cyclic_peptide)
-    print(flag_nc)
-    print(index_ss)
+    # print(feat['residue_index'])
+    # print(flag_cyclic_peptide)
+    # print(flag_nc)
+    feat['flag_cyclic_peptide'] = np.array(flag_cyclic_peptide)
     index_zero = [i for i in range(len(feat['residue_index'])) if feat['residue_index'][i] == 0]
     n_chain = len(index_zero)
     
     if not flag_nc:
         flag_nc = [0]*n_chain
+    if not flag_cyclic_peptide:
+        flag_cyclic_peptide = [0]*n_chain
 
     feat['cycpep_offset'] = []  # 位置编码矩阵
     feat['chain_start_pos'] = []  # 每条序列的起始位置
@@ -1023,18 +1406,17 @@ def get_offset_multicyc(
         else:
             feat['chain_length'].append(np.array(len(feat['residue_index'])-index_zero[i]))
 
-    if flag_cyclic_peptide and (flag_nc or index_ss):  # 存在环肽序列，需要构造位置编码矩阵
-        for i in range(n_chain):
+#    if flag_cyclic_peptide and (flag_nc or index_ss):  
+    for i in range(n_chain):
+        if flag_cyclic_peptide[i] == 1:               # 存在环肽序列，需要构造位置编码矩阵
             c_start = []  # c_start[i]和c_end[i]成环
             c_end = []
             if index_ss.get('c'+str(i)):
-	            for item in index_ss.get('c'+str(i)):
-	                c_start.append(item[0])
-	                c_end.append(item[1])
+                for item in index_ss.get('c'+str(i)):
+                    c_start.append(item[0])
+                    c_end.append(item[1])
             feat['cycpep_offset'][i] = np.array(calc_offset_matrix(feat['chain_length'][i], c_start, c_end, flag_nc[i])).astype(int)
-#    print(feat['cycpep_offset'])
-#    print(feat['chain_start_pos'])
-#    print(feat['chain_length'])
+
 
 
 def get_offset(
@@ -1043,14 +1425,11 @@ def get_offset(
 ):
     feat['cycpep_index'] = np.arange(1 + feat['residue_index'][-1])
     #
-    print(feat['residue_index'])
     # [0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
     #  24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
     #  48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64  0  1  2  3  4  5  6
     #  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25  0  1  2  3  4
     #  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25]
-    print(feat['cycpep_index'])  # [0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25]
-    print(disulfide_bond_pairs)  # []
     len_cycpep = len(feat['cycpep_index'])
     c_start = []  # c_start[i]和c_end[i]成环
     c_end = []
@@ -1058,7 +1437,6 @@ def get_offset(
         c_start.append(item[0])
         c_end.append(item[1])
     feat['offset_ss'] = np.array(calc_offset_matrix(len_cycpep, c_start, c_end)).astype(int)
-    print(feat['offset_ss'])
     # [[ 0.  1.  2.  3.  4.  5.  6.  7.  8.  9. 10. 11. 12. 13. 12. 11. 10.  9. 8.  7.  6.  5.  4.  3.  2.  1.]
     #  [ 1.  0.  1.  2.  3.  4.  5.  6.  7.  8.  9. 10. 11. 12. 13. 12. 11. 10. 9.  8.  7.  6.  5.  4.  3.  2.]
     #  [ 2.  1.  0.  1.  2.  3.  4.  5.  6.  7.  8.  9. 10. 11. 12. 13. 12. 11. 10.  9.  8.  7.  6.  5.  4.  3.]
@@ -1134,6 +1512,10 @@ def calc_offset_matrix(n_aa, c1, c2, flag_nc=1):
 
     # get the shortest path
     matrix = get_opt_path(matrix)
+    
+    for i in range(matrix.shape[0]):
+        for j in range(i+1, matrix.shape[0], 1):
+            matrix[i][j] *= -1
 
     return matrix
 
@@ -1407,10 +1789,13 @@ def msa_to_str(
 
 
 def run(
+        args_index_ss,
+        unnatural_residue: List[str],
         disulfide_bond_pairs: List[Tuple[int]],
         flag_cyclic_peptide: List[int],
         flag_nc: List[int],
         index_ss: Dict[List[Tuple[int]]],
+        dist_cst_ss: List[List[int]],
         queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]]]],
         result_dir: Union[str, Path],
         num_models: int,
@@ -1534,7 +1919,6 @@ def run(
     # 508 2048 = alphafold-multimer_v3 (models 1,2,3)
     # 508 1152 = alphafold-multimer_v3 (models 4,5)
     # 252 1152 = alphafold-multimer_v[1,2]
-
     set_if = lambda x, y: y if x is None else x
     if model_type in ["alphafold2_multimer_v1", "alphafold2_multimer_v2"]:
         (max_seq, max_extra_seq) = (set_if(max_seq, 252), set_if(max_extra_seq, 1152))
@@ -1656,6 +2040,15 @@ def run(
             logger.exception(f"Could not generate input features {jobname}: {e}")
             continue
 
+        
+        # zc
+        unnatural = unnatural_residue
+        indices = np.where(feature_dict['aatype'] == len(residue_constants.restypes))[0]
+        if model_type == 'alphafold2_multimer_v3':
+            assert len(indices) == len(unnatural)
+            for i, name in enumerate(unnatural):
+                feature_dict['aatype'][indices[i]] = residue_constants.restypes.index(name)
+
         ######################
         # predict structures
         ######################
@@ -1711,6 +2104,9 @@ def run(
                 first_job = False
 
             results = predict_structure(
+                args_index_ss = args_index_ss,
+                dist_cst_ss=dist_cst_ss,
+                index_ss=index_ss,
                 prefix=jobname,
                 result_dir=result_dir,
                 feature_dict=feature_dict,
@@ -1731,10 +2127,13 @@ def run(
                 save_single_representations=save_single_representations,
                 save_pair_representations=save_pair_representations,
                 save_recycles=save_recycles,
+                flag_nc=flag_nc,
+                cp=flag_cyclic_peptide,
             )
             result_files = results["result_files"]
             ranks.append(results["rank"])
             metrics.append(results["metric"])
+
 
         except RuntimeError as e:
             # This normally happens on OOM. TODO: Filter for the specific OOM error message
@@ -2010,23 +2409,32 @@ def main():
                              '[[2 0 7][1 2 8]] denotes the 3rd chain and the 2nd chain are cyclic peptide by ss. '
                              'In the 3rd chain, the 1st amino acid and the 8th amino acid are linked by ss. '
                              'In the 2nd chain, the 3rd amino acid and the 9th amino acid are linked by ss. ')
+    parser.add_argument("--custom-dist-cst", type=int, nargs='+', action='append', default=[],
+                        help="the indices start at 0, "
+                             "the first number is chain_id, "
+                             "the second number is the type of constraints, 1 for head-to-tail, 2 for disulfide bridges, "
+                             "the third and fourth number is the indices of amino acid pairs, "
+                             "the five number is the distance in nanometer*100."
+                             "For example, [[2 2 0 7 15]] denotes the distance between the two sulphur atoms "
+                             "in amino acid 0 and 7 of peptide chain 2 is constrained to 0.15 nanometer. "
+                             "For another example, [[3 1 0 7 16]] denotes the distance between n-terminal of amino acid 0"
+                             "and c-terminal pf amino acid 7 in peptide chain 3 is constrained to 0.16 nanometer. "
+                             "Note that the length of peptide chain 3 is 8. ")
+    parser.add_argument("--unnatural_residue", type=str, nargs='+', default=[],
+                        help="the order of unatural residue.")
 
     args = parser.parse_args()
 
-    # print(args.disulfide_bond_pairs)
     disulfide_bond_pairs = []
     for i in range(0, len(args.disulfide_bond_pairs), 2):
         disulfide_bond_pairs.append((args.disulfide_bond_pairs[i], args.disulfide_bond_pairs[i + 1]))
-    # print(disulfide_bond_pairs)
+
     index_ss = {}
     for i in range(len(args.index_ss)):
         pair_ss = []
         for j in range(1, len(args.index_ss[i]), 2):
             pair_ss.append((args.index_ss[i][j], args.index_ss[i][j+1]))
         index_ss['c'+str(args.index_ss[i][0])] = pair_ss
-#    print(args.flag_cyclic_peptide)
-#    print(args.flag_nc)
-#    print(index_ss)
 
     # disable unified memory
     if args.disable_unified_memory:
@@ -2047,7 +2455,7 @@ def main():
     queries, is_complex = get_queries(args.input, args.sort_queries_by)
     model_type = set_model_type(is_complex, args.model_type)
 
-    download_alphafold_params(model_type, data_dir)
+    # download_alphafold_params(model_type, data_dir)
 
     if args.msa_mode != "single_sequence" and not args.templates:
         uses_api = any((query[2] is None for query in queries))
@@ -2063,10 +2471,13 @@ def main():
         args.num_relax = args.num_models * args.num_seeds
 
     run(
+        args_index_ss = args.index_ss,
+        unnatural_residue=args.unnatural_residue,
         disulfide_bond_pairs=disulfide_bond_pairs,
         flag_cyclic_peptide=args.flag_cyclic_peptide,
         flag_nc=args.flag_nc,
         index_ss=index_ss,
+        dist_cst_ss=args.custom_dist_cst,
         queries=queries,
         result_dir=args.results,
         use_templates=args.templates,

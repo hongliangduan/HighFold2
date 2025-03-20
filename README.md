@@ -4,42 +4,47 @@
 
 ## Installation
 
-HighFold2 is based on LocalColabFold, which is available at https://github.com/YoshitakaMo/localcolabfold, so you should install it first. Then, you should download our source code as follows:
+You should first download the source code and dependencies as follows:
 
 ```bash
 git clone https://github.com/hongliangduan/HighFold2.git
 cd HighFold2
+conda create --name highfold2 --file requirements_conda.txt --channel bioconda
+conda activate highfold2
+pip install -r requirements_pip.txt
+pip install -e ./colabfold
+pip install -e ./alphafold
 ```
-
-After, you should replace the original alphafold and colabfold folders in /localcolabfold/colabfold-conda/lib/python3.10/site-packages/ with the ones from the modify\_code folder. For relaxation and training, you should also install some other packages. All packages we used can be seen in the requirement.txt.
 
 ## Usage
 
-### Training
-
-For the training, you should be in the modified locallocalfold environment and the HighFold2 folder and obtain the feature firstly as follows:
-
-```bash
-python gen_feature.py
-```
-
-After getting the feature, you should change the directory to the training folder and copy the original AlphaFold-Multimer parameters to the colabfold folder, then run the training.py as follows:
-
-```bash
-cd training
-python training.py
-```
-
 ### Prediction
 
-For the prediction, you should be in the HighFold2 folder and copy the trained parameters to the colabfold/params folder. Then, prepare the fasta file for your sequence, all the unnatural residues are replaced with 'X' in fasta files. Finally, enter a command similar to the following in the terminal:
+For the prediction, you should download our fine-tuned parameters from [onedrive](https://1drv.ms/f/c/a6a575f7399b61f9/Ejavf9uTnRBHhQAVQWKhJ7wByd57xfQALTpMgoZqVXnmBg?e=Ij1NaR) and put them in the fine_tuning/params folder. Then, you should prepare the fasta file for your sequence, all the unnatural residues are replaced with 'X' in fasta files. Finally, enter a command similar to the following in the terminal, we also provide some detailed prediction examples in the prediction.ipynb.
 
 ```bash
-colabfold_batch --model-type alphafold2_multimer_v3 {fasta_path} {output_path} --unnatural_residue {unnatural_amino_acids} --flag-cyclic-peptide 1 --flag-nc 1 --amber
+python prediction.py --model-type alphafold2_multimer_v3 {fasta_path} {output_path} --unnatural_residue {unnatural_amino_acids} --flag-cyclic-peptide 1 --flag-nc 1 --amber
 ```
 
 All the flags useful for prediction can be seen by typing the following command in the terminal:
 
 ```bash
-colabfold_batch -h
+python prediction.py -h
+```
+
+### Training
+
+For the training, you should obtain the feature and AlphaFold-Multimer's parameters firstly as follows:
+
+```bash
+python gen_feature.py
+wget https://storage.googleapis.com/alphafold/alphafold_params_2022-12-06.tar
+mkdir -p alphafold_multimer/params
+tar -xvf alphafold_params_2022-12-06.tar -C alphafold_multimer/params
+```
+
+After getting the feature and parameters, you can run the training.py as follows:
+
+```bash
+python training.py
 ```

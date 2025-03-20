@@ -110,4 +110,6 @@ for i in fasta:
     non_natural_aa = find_non_natural_aa(pdbid)
     non_natural_aa = non_natural_aa.split(':')
     result_dir = './feature/'+ pdbid
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
     generate_feature(i, result_dir, non_natural_aa)
